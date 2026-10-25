@@ -12,6 +12,7 @@
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/init.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -31,8 +32,48 @@
  * does not provide the deferred precharge below it on nabu. */
 #define QCOM_BMS_DC_MIN_VBAT_UV 3000000
 
+/* 直充在线时，它自己的大电流会把 VBUS 压下去，tcpm 因此短暂误报 offline。
+ * 若此时立刻关直充，VBUS 回升 → PD 重协商 → 又开，形成约 3.3 秒周期的
+ * 震荡，电池永远进不去稳态（实测 input_current_limit 一直是 0、电流持续
+ * 为负）。所以在直充仍在 SWITCHING 期间给 cc_online 一个粘滞窗口。 */
+#define QCOM_BMS_CC_STICKY_MS 5000
+
 /* Charger FULL/INHIBIT claims are only credible near the float voltage. */
 #define QCOM_BMS_MIN_FULL_VBAT_UV 4000000
+
+/*
+ * 而且还得看电流。大电流充电时端电压 = 开路电压 + I·R，4.9A 在 ~90mΩ 上能
+ * 抬出 0.44V —— 12% 电量、真实开路 3.6V 的电池，端电压会显示 4.05V，轻松
+ * 越过上面的 4.0V 门槛，于是被误判成"已充满"（DMS 就显示充满，而电量还在
+ * 涨）。FULL 只可能在 CV 阶段末期成立，那时电流已经掉到截止值附近，所以
+ * 加一条电流上限：0.1C ≈ 870mA。
+ */
+#define QCOM_BMS_FULL_CURRENT_UA 900000
+
+/* 净放电超过这个值就认定在放电，不再等充电器状态（拔线后它滞后很久）。 */
+#define QCOM_BMS_DISCHARGE_CURRENT_UA 100000
+
+/*
+ * 直充要"真的在出力"才让 PMIC 让位。500mA 是个宽松下限：正常直充一走就是
+ * 安培级，空转时是 0，两者不会混淆。
+ */
+#define QCOM_BMS_DC_MIN_DELIVER_UA 500000
+
+/*
+ * 低于这个 VBAT 就不让直充参与。
+ *
+ * 实测低电量（~11%、3.6V）时 LN8000 的 ADC 会冻住（IIN 读数恒为
+ * 58680uA 不变）、op_mode 缓存在 SWITCHING 但完全没有输出，同时
+ * PMIC 也只剩百来毫安 —— 两条路互相干扰，插着 9V/3A 电池仍在掉。
+ * 这种情况下让 PMIC 独占 VBUS 更可靠：它有 3A ICL + 1.95A FCC。
+ */
+/*
+ * 3.7V 时禁用直充这条规则是基于"直充在低 VBAT 下空转"的错误结论写的。
+ * 真正原因是 ln8000_has_fault() 把已 disable 的 IIN_OC 状态位也算作故障，
+ * 导致直充被误关。那个 bug 修掉后，低 VBAT 下直充应该能正常接管，所以
+ * 门槛压到 3.2V（仅作为电池真正危险时的兜底，不再是常规路径）。
+ */
+#define QCOM_BMS_DC_DISABLE_BELOW_UV 3200000
 
 struct qcom_bms_fg {
 	struct device *dev;
@@ -92,6 +133,12 @@ struct qcom_bms_info {
 	struct power_supply *tcpm_psy;
 	struct device_node *tcpm_np;
 	bool pmic_usbin_suspended;
+
+	/* 最近一次 tcpm 报 online=1 的 jiffies，用于直充期间的粘滞判断 */
+	unsigned long cc_online_last;
+
+	/* 上一次 evaluate 时充电器是否在位，用于检测"刚插入"这个边沿 */
+	bool cc_was_online;
 
 	int status;
 	bool charge_done;
@@ -585,19 +632,28 @@ static void qcom_bms_update_status(struct qcom_bms_info *info)
 	charge_done = (pmic_status == POWER_SUPPLY_STATUS_FULL ||
 		       direct_status == POWER_SUPPLY_STATUS_FULL) &&
 		      (!fg_voltage_known ||
-		       vbat_uv >= QCOM_BMS_MIN_FULL_VBAT_UV);
+		       vbat_uv >= QCOM_BMS_MIN_FULL_VBAT_UV) &&
+		      (!fg_current_valid ||
+		       fg_current < QCOM_BMS_FULL_CURRENT_UA);
 
 	/* Charger state is authoritative; FG current is only a fallback. */
-	if (charge_done)
+	if (charge_done) {
 		new_status = POWER_SUPPLY_STATUS_FULL;
-	else if (direct_status == POWER_SUPPLY_STATUS_CHARGING ||
-		 pmic_status == POWER_SUPPLY_STATUS_CHARGING)
-		new_status = POWER_SUPPLY_STATUS_CHARGING;
-	else if (!input_present ||
-		 pmic_status == POWER_SUPPLY_STATUS_DISCHARGING ||
-		 (fg_current_valid && fg_current < 0))
+	} else if (!input_present ||
+		   (fg_current_valid && fg_current < -QCOM_BMS_DISCHARGE_CURRENT_UA)) {
+		/*
+		 * 电流明显为负就一定是放电，放在充电器状态之前判断。
+		 * PMIC 的 status 在拔线后会滞后很久（实测一分钟还报 CHARGING），
+		 * 若按旧顺序先看 pmic_status，拔线后界面会一直显示"充电中"。
+		 */
 		new_status = POWER_SUPPLY_STATUS_DISCHARGING;
-	else if (fg_current_valid && fg_current > 0)
+	} else if (direct_status == POWER_SUPPLY_STATUS_CHARGING ||
+		   pmic_status == POWER_SUPPLY_STATUS_CHARGING) {
+		new_status = POWER_SUPPLY_STATUS_CHARGING;
+	} else if (pmic_status == POWER_SUPPLY_STATUS_DISCHARGING ||
+		   (fg_current_valid && fg_current < 0)) {
+		new_status = POWER_SUPPLY_STATUS_DISCHARGING;
+	} else if (fg_current_valid && fg_current > 0)
 		new_status = POWER_SUPPLY_STATUS_CHARGING;
 	else
 		new_status = POWER_SUPPLY_STATUS_NOT_CHARGING;
@@ -705,9 +761,92 @@ static void qcom_bms_evaluate_direct_charge(struct qcom_bms_info *info)
 					POWER_SUPPLY_PROP_ONLINE, &val);
 	cc_online = !ret && val.intval;
 
+	if (cc_online)
+		info->cc_online_last = jiffies;
+
+	/*
+	 * 插入瞬间强制 resume 一次 PMIC。
+	 *
+	 * PMIC 的 input current limit 只在 smb_status_change_work 里写，而那个
+	 * work 是由 set_usbin_suspend(false) 调度的。如果开机时没插电，段 C
+	 * 会先把 pmic_usbin_suspended 刷成 false，之后插电就再也没有理由调用
+	 * resume —— ICL 永远停在 0（实测 icl=0、电池 -1.8A 放电）。
+	 *
+	 * 所以这里只在 cc_online 由 0 变 1 的那个边沿补一次。边沿触发是幂等的
+	 * 一次写入，不会像无条件调用那样把 mod_delayed_work 和 I2C 刷爆。
+	 */
+	if (cc_online && !info->cc_was_online && have_pmic &&
+	    pmic.ops->set_usbin_suspend) {
+		if (pmic.ops->set_usbin_suspend(pmic.priv, false))
+			dev_warn(info->dev,
+				 "failed to resume PMIC USBIN on plug-in\n");
+		else
+			info->pmic_usbin_suspended = false;
+	}
+	info->cc_was_online = cc_online;
+
+	/*
+	 * 直充正在 SWITCHING 说明 VIN 确实还在（op_mode 要求输入存在），
+	 * 此时 tcpm 报 offline 多半是自己的大电流把 VBUS 压低了 —— 不是拔线。
+	 * 容忍一个窗口，让直充把电流稳下来；超时仍 offline 则按真断开处理。
+	 */
+	if (!cc_online && direct_online &&
+	    time_before(jiffies,
+			info->cc_online_last + msecs_to_jiffies(QCOM_BMS_CC_STICKY_MS))) {
+		cc_online = true;
+		dev_dbg(info->dev,
+			"tcpm offline while direct charge is switching, holding\n");
+	}
+
 	want_on = cc_online && READ_ONCE(info->authenticated) &&
 		  health == POWER_SUPPLY_HEALTH_GOOD &&
 		  vbat_uv >= QCOM_BMS_DC_MIN_VBAT_UV;
+
+	/*
+	 * 低 VBAT 时不让直充上场：它在这个区段会半死不活地占着 SWITCHING
+	 * 状态却不输出，反而拖垮整条充电链路。让 PMIC 独自承担，等电压
+	 * 爬过阈值再交还给直充。
+	 */
+	if (vbat_uv < QCOM_BMS_DC_DISABLE_BELOW_UV && want_on) {
+		want_on = false;
+		dev_info_ratelimited(info->dev,
+				     "low VBAT (%d uV): keeping PMIC-only, direct charge withheld\n",
+				     vbat_uv);
+	}
+
+	/*
+	 * 低电压窗口：直充（LN8000）因为 VBAT 低于门槛被禁用，这是对的 ——
+	 * 它不支持 3V 以下的电芯。但此时必须让 PMIC 的 USBIN 通路接手，
+	 * 由 PM8150B 的硬件 trickle/pre-charge 状态机用小电流把电压拉回来。
+	 *
+	 * 去重依赖 info->pmic_usbin_suspended，它在上电时被初始化为 true
+	 * （见 probe），所以第一次进来一定会 resume 一次、把 ICL 写下去；
+	 * 之后该字段变成 false，不会再重复写，避免 mod_delayed_work 把
+	 * I2C 打爆。
+	 */
+	/*
+	 * 低 VBAT 时确保 PMIC 醒着（它才写得到 ICL）。
+	 *
+	 * 这里必须去重：set_usbin_suspend(false) 内部会 mod_delayed_work，
+	 * 而本函数被 psy notifier 高频调用。曾经写成无条件调用，结果 work
+	 * 被反复调度、I2C 被打爆（usb_type 读回 EAGAIN、icl 在 0/250mA 之间
+	 * 震荡）。所以只在"确实处于挂起状态"时写一次。
+	 *
+	 * 门槛用 DC_DISABLE_BELOW_UV（3.2V，仅电池真正危险时的兜底）。
+	 */
+	if (!want_on && cc_online && have_pmic &&
+	    vbat_uv < QCOM_BMS_DC_DISABLE_BELOW_UV &&
+	    info->pmic_usbin_suspended &&
+	    pmic.ops->set_usbin_suspend) {
+		if (pmic.ops->set_usbin_suspend(pmic.priv, false))
+			dev_warn_once(info->dev,
+				      "failed to resume PMIC USBIN at low VBAT\n");
+		else if (info->pmic_usbin_suspended)
+			dev_info(info->dev,
+				 "low VBAT (%d uV): resuming PMIC USBIN for pre-charge\n",
+				 vbat_uv);
+		info->pmic_usbin_suspended = false;
+	}
 
 	if (want_on && !direct_online) {
 		ret = direct.ops->set_charging_enabled(direct.priv, true);
@@ -740,7 +879,23 @@ static void qcom_bms_evaluate_direct_charge(struct qcom_bms_info *info)
 		direct_online = online;
 
 	if (have_pmic && pmic.ops->set_usbin_suspend) {
-		bool want_pmic_susp = direct_online;
+		/*
+		 * 判据是"直充真的在出力"，而不是"直充被启用了"。
+		 *
+		 * direct_online 只等于 chg_en && op_mode == SWITCHING —— 那是芯片
+		 * 内部状态，不保证有电流送出。低电量时实测直充报 SWITCHING、电池
+		 * 却仍在放电；若据此挂起 PMIC，两条路同时不给电，插着 9V/3A 的
+		 * 充电器电量照掉。所以这里读直充的实际输出电流，超过阈值才算它
+		 * 接管了 VBUS，PMIC 才让位；否则 PMIC 保持开启兜底。
+		 */
+		int direct_i = 0;
+		bool direct_delivering = false;
+
+		if (direct_online && direct.ops->get_current_now &&
+		    !direct.ops->get_current_now(direct.priv, &direct_i))
+			direct_delivering = direct_i > QCOM_BMS_DC_MIN_DELIVER_UA;
+
+		bool want_pmic_susp = direct_delivering;
 
 		if (want_pmic_susp != info->pmic_usbin_suspended) {
 			ret = pmic.ops->set_usbin_suspend(pmic.priv,
@@ -1134,6 +1289,19 @@ static int qcom_bms_probe(struct platform_device *pdev)
 
 	info->dev = &pdev->dev;
 	info->status = POWER_SUPPLY_STATUS_UNKNOWN;
+	/*
+	 * PM8150B 上电时 USBIN 通路默认是挂起的。这里必须假定"已挂起"，
+	 * 否则去重逻辑（"状态变化才写"）永远不会触发第一次 resume，
+	 * PMIC 从头到尾不会被配置，input current limit 停在 0 —— 实测表现
+	 * 为插着 9V/3A 充电器、icl=0、电池 -1.8A 放电。
+	 *
+	 * 反过来也不能无条件写：set_usbin_suspend() 内部会 mod_delayed_work，
+	 * 本函数被 psy notifier 高频调用，无脑调用会把 I2C 打爆（usb_type
+	 * 读回 EAGAIN、icl 在 0/250mA 之间震荡）。
+	 *
+	 * 初值 true + 现有去重，正好让第一次走 resume、之后不再重复。
+	 */
+	info->pmic_usbin_suspended = true;
 	of_property_read_u32(pdev->dev.of_node, "qcom,required-authenticators",
 			     &info->required_auth_mask);
 	info->required_auth_mask &= GENMASK(QCOM_BMS_AUTH_MAX - 1, 0);

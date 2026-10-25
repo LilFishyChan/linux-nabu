@@ -639,9 +639,25 @@ static int ln8000_enable_charging(struct ln8000_info *info, bool en)
 
 static bool ln8000_has_fault(struct ln8000_info *info)
 {
-	return READ_ONCE(info->vbat_ov) || READ_ONCE(info->vbus_ov) ||
-	       READ_ONCE(info->iin_oc) || READ_ONCE(info->tdie_fault) ||
-	       READ_ONCE(info->wdt_fault);
+	struct ln8000_pdata *p = &info->pdata;
+	bool fault;
+
+	/*
+	 * 被 DT 显式关掉的保护项不能在这里再次生效。
+	 *
+	 * iin-ocp-disable 只屏蔽 IIN_OCP 中断，并不阻止 INT 状态寄存器里的
+	 * IIN_OC 位置位。而 FAULT_INT 没有被屏蔽，一旦它触发就会走到这里
+	 * 并关掉直充 —— 于是 DTS 里的 iin-ocp-disable 形同虚设，直充在
+	 * 输入电流有一点波动时就被判故障关掉，表现是 op_mode 还缓存着
+	 * SWITCHING（online 报 true）、实际零输出。
+	 */
+	fault = READ_ONCE(info->vbat_ov) || READ_ONCE(info->vbus_ov) ||
+		READ_ONCE(info->tdie_fault) || READ_ONCE(info->wdt_fault);
+
+	if (!p->iin_ocp_disable && READ_ONCE(info->iin_oc))
+		fault = true;
+
+	return fault;
 }
 
 static int ln8000_get_status(void *priv, int *status)
@@ -673,8 +689,16 @@ static int ln8000_get_current_now(void *priv, int *val)
 	int ret;
 
 	ret = ln8000_get_adc_data(info, LN8000_ADC_CH_IIN, &iin);
-	if (ret < 0)
+	if (ret < 0) {
+		/* 临时诊断：协调器靠这个返回值判断直充有没有真的在出力 */
+		dev_info_ratelimited(info->dev, "IIN ADC read failed: %d\n", ret);
 		return ret;
+	}
+
+	dev_info_ratelimited(info->dev,
+			     "IIN ADC raw=%d uA, reported=%d uA, op_mode=%u chg_en=%d\n",
+			     iin, iin * 2, READ_ONCE(info->op_mode),
+			     READ_ONCE(info->chg_en));
 
 	*val = iin * 2;
 	return 0;
@@ -703,10 +727,16 @@ static int ln8000_get_input_current_limit(void *priv, int *val)
 static int ln8000_get_health(void *priv, int *val)
 {
 	struct ln8000_info *info = priv;
+	struct ln8000_pdata *p = &info->pdata;
 
 	if (READ_ONCE(info->vbat_ov) || READ_ONCE(info->vbus_ov))
 		*val = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
-	else if (READ_ONCE(info->iin_oc))
+	/*
+	 * iin_oc 同样要尊重 iin-ocp-disable：该保护在 DT 里被显式关掉后，
+	 * 状态位仍可能置位（只屏蔽了中断）。报 OVERCURRENT 会让协调器
+	 * 认为直充不健康而永不启用，DTS 的开关就白配了。
+	 */
+	else if (!p->iin_ocp_disable && READ_ONCE(info->iin_oc))
 		*val = POWER_SUPPLY_HEALTH_OVERCURRENT;
 	else if (READ_ONCE(info->tdie_fault))
 		*val = POWER_SUPPLY_HEALTH_OVERHEAT;

@@ -134,7 +134,18 @@
 
 	qcom_bms: battery-manager {
 		compatible = "qcom,pm8150b-bms";
-		qcom,required-authenticators = <3>;
+		/*
+		 * 这里原本是 <3>，即要求两个认证器都通过才允许充电。但整个
+		 * DTS 里没有任何 qcom,authenticator 引用，auth[].dev 全是 NULL，
+		 * authenticated_mask 恒为 0 —— 于是 authenticated 永远是 false，
+		 * 协调器的 want_on 永远不成立，直充（LN8000）从头到尾没被启用过。
+		 *
+		 * 表现就是整夜排查看到的：op_mode 缓存 SWITCHING（online 报 true）、
+		 * 实际零输出、LN8000 ADC 冻结、插着 9V/3A 只有 PMIC 那 1.875A。
+		 *
+		 * 没有配认证器就不要要求认证。
+		 */
+		qcom,required-authenticators = <0>;
 		/* tcpm source psy (CC-driven attach/detach); powers direct-charge teardown */
 		qcom,tcpm-psy = <&pm8150b_typec>;
 		status = "okay";
@@ -955,14 +966,14 @@
 					 PDO_FIXED_DATA_SWAP)>;
 
 		sink-pdos = <PDO_FIXED(5000, 3000,
-					 PDO_FIXED_DUAL_ROLE |
-					 PDO_FIXED_USB_COMM |
-					 PDO_FIXED_DATA_SWAP)
-			     PDO_FIXED(9000, 3000,
-					 PDO_FIXED_DUAL_ROLE |
-					 PDO_FIXED_USB_COMM |
-					 PDO_FIXED_DATA_SWAP)
-			     PDO_PPS_APDO(5000, 12000, 3000)>;
+				 PDO_FIXED_DUAL_ROLE |
+				 PDO_FIXED_USB_COMM |
+				 PDO_FIXED_DATA_SWAP)
+		     PDO_FIXED(9000, 3000,
+				 PDO_FIXED_DUAL_ROLE |
+				 PDO_FIXED_USB_COMM |
+				 PDO_FIXED_DATA_SWAP)
+		     PDO_PPS_APDO(5000, 12000, 3000)>;
 
 		op-sink-microwatt = <33000000>;
 

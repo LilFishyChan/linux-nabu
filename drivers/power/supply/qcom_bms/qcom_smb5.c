@@ -27,6 +27,45 @@
 
 #define SMB_BASE 0x100
 
+/*
+ * 地址体系（已与 vendor smb5-reg.h 逐条核对）：
+ *   chip->base = DTS 的 reg = 0x1000 = vendor 的 CHGR_BASE
+ *   SMB_BASE   = 0x100           = vendor 的 DCDC_BASE - CHGR_BASE
+ * 所以绝对地址 = chip->base + 这些偏移。
+ *
+ * 下面是 vendor 在 probe 里会配、而本移植版一直漏掉的两项 ——
+ * 它们正是低电量充不进电的原因：
+ *
+ * 1. JEITA_EN_CFG（CHGR_BASE + 0x90）：硬件温度补偿。vendor 无条件
+ *    关掉它（改用软件 JEITA）。本版没碰过，默认开着，温度判断一旦
+ *    落到 cold/warm 档就把充电电流砍到 pre-charge 级别。
+ *
+ * 2. DCDC_ENG_SDCDC_CFG5（DCDC_BASE + 0xC4，bits 7:6）：低 VBAT 时
+ *    允许高功率充电的阈值。vendor 取 3.6V（保守），这里取 3.3V，让
+ *    10% 上下（约 3.5V）的电芯也能接受正常的 CC 电流。
+ *    注意：实测在该项上于 3.6V/3.3V 之间切换并不改变实际充电电流 ——
+ *    低电量充不进电的真正原因是 DTS 里 required-authenticators 要求了
+ *    并不存在的认证器，协调器从未启用直充。此项保留但与那个故障无关。
+ */
+#define CHGR_JEITA_EN_CFG    (0x90)              /* CHGR_BASE + 0x90 */
+#define JEITA_EN_ALL_MASK    (0x0F)              /* cold/hot × fcv/ccc */
+#define DCDC_SDCDC_CFG5      (SMB_BASE + 0xC4)   /* DCDC_BASE + 0xC4 */
+#define ENG_SDCDC_BAT_HPWR_MASK  (0xC0)          /* GENMASK(7,6) */
+/*
+ * 阈值从 3.6V 降到 3.3V。
+ *
+ * 该字段的含义是"VBAT 高于此值才允许高功率充电"。vendor 取 3.6V 是保守
+ * 策略：实测电池 3.50–3.55V（10% 上下）时 ICL 被压到 1.875A，而 3.75V
+ * 以上能跑 4.7A —— 差值正好卡在这条线两侧。
+ *
+ * 降到 3.3V 后，3.5V 就能放开到 3.05A（0.35C）。锂电池标准快充是
+ * 0.5–1C，所以这个电流对 10% SOC 的电池仍属保守范围，不属于危险区；
+ * vendor 的高阈值是求稳，不是安全红线。
+ *
+ * 枚举值（vendor smb5-reg.h）：3P3=0x00 / 3P4=0x40 / 3P5=0x80 / 3P6=0xC0
+ */
+#define BOOST_MODE_THRESH_3P3_V  (0x00)
+
 #define BATTERY_CHARGER_STATUS_1 0x06
 #define BATTERY_CHARGER_STATUS_MASK GENMASK(2, 0)
 
@@ -626,6 +665,14 @@ static const struct smb_init_register smb5_init_seq[] = {
 	{ .addr = CHARGING_ENABLE_CMD,
 	  .mask = CHARGING_ENABLE_CMD_BIT,
 	  .val = CHARGING_ENABLE_CMD_BIT },
+	/* 关硬件 JEITA（vendor 同样这么干，改由软件判断温度） */
+	{ .addr = CHGR_JEITA_EN_CFG,
+	  .mask = JEITA_EN_ALL_MASK,
+	  .val = 0 },
+	/* 低 VBAT 高功率门槛 3.3V（vendor 是 3.6V，这里放宽） */
+	{ .addr = DCDC_SDCDC_CFG5,
+	  .mask = ENG_SDCDC_BAT_HPWR_MASK,
+	  .val = BOOST_MODE_THRESH_3P3_V },
 	/* Enable BC1P2 auto Src detect */
 	{ .addr = USBIN_OPTIONS_1_CFG,
 	  .mask = AUTO_SRC_DETECT_BIT,
@@ -648,6 +695,12 @@ static const struct smb_init_register smb5_init_seq[] = {
 	 * Enable Automatic Input Current Limit, this will slowly ramp up the current
 	 * When connected to a wall charger, and automatically stop when it detects
 	 * the charger current limit (voltage drop?) or it reaches the programmed limit.
+	 */
+	/*
+	 * AICL 保持开启。曾经怀疑它把低电量时的输入限流砍到极低（看到
+	 * ICL 设 3A 而实际只有 117mA），关掉之后行为毫无变化 —— 那个 117mA
+	 * 是 LN8000 ADC 冻结后的假值，与 AICL 无关。AICL 是 VBUS 跌落时的
+	 * 保护，关掉只会在弱适配器上把电压拽塌，所以恢复。
 	 */
 	{ .addr = USBIN_AICL_OPTIONS_CFG,
 	  .mask = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT |
