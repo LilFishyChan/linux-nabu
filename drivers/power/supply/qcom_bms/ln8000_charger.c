@@ -690,15 +690,9 @@ static int ln8000_get_current_now(void *priv, int *val)
 
 	ret = ln8000_get_adc_data(info, LN8000_ADC_CH_IIN, &iin);
 	if (ret < 0) {
-		/* 临时诊断：协调器靠这个返回值判断直充有没有真的在出力 */
 		dev_info_ratelimited(info->dev, "IIN ADC read failed: %d\n", ret);
 		return ret;
 	}
-
-	dev_info_ratelimited(info->dev,
-			     "IIN ADC raw=%d uA, reported=%d uA, op_mode=%u chg_en=%d\n",
-			     iin, iin * 2, READ_ONCE(info->op_mode),
-			     READ_ONCE(info->chg_en));
 
 	*val = iin * 2;
 	return 0;

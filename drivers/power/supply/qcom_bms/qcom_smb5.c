@@ -103,6 +103,28 @@
 #define OCP_CHARGER_BIT BIT(1)
 
 #define USBIN_CMD_IL 0x340
+
+/*
+ * USBIN 子块（USBIN_BASE = 0x1300，本驱动 chip->base = 0x1000，
+ * 所以这里的偏移都是相对 0x1000 的 0x3xx）。
+ *
+ * USBIN_ADAPTER_ALLOW_CFG 是常开的 OVP 比较器窗口。bootloader 往往
+ * 把它留在"只允许 5V"，而 PD 一旦把 VBUS 拉到 9V/PPS，这个比较器
+ * 就会锁存过压（USBIN_INT_RT_STS 的 bit3），充电被永久门控 ——
+ * 表现正是插着 9V/3A、BATTERY_CHARGER_STATUS_1 却在
+ * PAUSE/DISABLE 之间跳、ICL 读到 0。
+ * 参见 asidko/pm6150-charger-mainline 的 SW_OVERRIDE_HC_MODE 第 8 步。
+ */
+#define USBIN_INT_RT_STS        0x310
+#define USBIN_INT_LATCHED_CLR   0x314
+#define USBIN_ADAPTER_ALLOW_OVERRIDE 0x344
+#define USBIN_ADAPTER_ALLOW_CFG 0x360
+
+#define USBIN_ADAPTER_ALLOW_5V_TO_12V        12   /* 0x0C: 允许 5-12V */
+#define USBIN_ADAPTER_ALLOW_OVERRIDE_CONTINUOUS BIT(3) /* 接受 4-12V 全范围 */
+#define USBIN_OV_RT_STS_BIT     BIT(3)  /* 0x1310: 输入过压 */
+#define USBIN_UV_RT_STS_BIT     BIT(2)  /* 0x1310: 输入欠压 */
+#define USBIN_SUSPEND_ON_COLLAPSE_BIT   BIT(7) /* 0x1380: 塌陷即挂起 */
 #define USBIN_SUSPEND_BIT BIT(0)
 
 #define CMD_APSD 0x341
@@ -172,17 +194,33 @@
 #define DCP_CURRENT_UA 1500000
 #define UNVERIFIED_CURRENT_UA 2000000
 
+/*
+ * APSD 是 BC1.2 的充电器类型检测，硬件本身要 1-2 秒才置 DONE。
+ * 原来 1 秒就 rerun，正好在检测完成前把它重置掉，于是 DONE 永远
+ * 起不来、ICL 永远设不上（实测：插着 PD 9V/3A 的充电器，icl=0、
+ * 电池持续放电）。放宽到 3 秒，并给重试次数封顶。
+ */
+#define APSD_RETRY_MS 3000
+#define APSD_MAX_RETRIES 5
+
 /* SMB5 (PM8150b/PM7250b) registers represent current in 1/40th amp increments */
 #define CURRENT_SCALE_FACTOR 25000
 
+/*
+ * BATTERY_CHARGER_STATUS_1 的 bit2:0 编码，顺序按 PM8150B 硬件手册
+ * （与 vendor smb5-reg.h 一致），不能凭字面猜：INHIBIT 是 0、PAUSE 是 6。
+ * 原先这里把 TRICKLE 当成 0、还凭空多编了一个 FAST_CHARGE，读到 6
+ * （真实含义 PAUSE）时被当成 INHIBIT，进而报成 "Full" —— 表现为
+ * 电量 0% 显示已充满、插着 9V/3A 却充不进去。
+ */
 enum charger_status {
-	TRICKLE_CHARGE = 0,
+	INHIBIT_CHARGE = 0,
+	TRICKLE_CHARGE,
 	PRE_CHARGE,
-	FAST_CHARGE,
 	FULLON_CHARGE,
 	TAPER_CHARGE,
 	TERMINATE_CHARGE,
-	INHIBIT_CHARGE,
+	PAUSE_CHARGE,
 	DISABLE_CHARGE,
 };
 
@@ -218,6 +256,7 @@ struct smb_chip {
 	u32 constant_charge_current_max_ua;
 	bool authenticated;
 	u32 voltage_max_design_uv;
+	unsigned int apsd_retries;
 };
 
 static void smb_get_batt_info(struct smb_chip *chip)
@@ -343,6 +382,7 @@ static int smb_get_prop_status(void *priv, int *val)
 		return rc;
 	}
 
+
 	rc = smbx_ov_status(chip);
 	if (rc < 0)
 		return rc;
@@ -355,20 +395,31 @@ static int smb_get_prop_status(void *priv, int *val)
 
 	stat &= BATTERY_CHARGER_STATUS_MASK;
 
+	/*
+	 * 按硬件状态的实际含义映射，不是照抄 vendor：
+	 *   TRICKLE/PRE/FULLON/TAPER  正在充            -> CHARGING
+	 *   TERMINATE                 达到终止条件，真满 -> FULL
+	 *   INHIBIT                   硬件主动禁止充电  -> NOT_CHARGING
+	 *   PAUSE                     暂时停充          -> NOT_CHARGING
+	 *   DISABLE                   关闭充电          -> NOT_CHARGING
+	 *
+	 * vendor 把 INHIBIT 也报成 FULL，是为了让安卓状态栏别闪；代价是
+	 * 低电量被禁止充电时显示"已充满"。这里按实际报，避免上层误判。
+	 */
 	switch (stat) {
 	case TRICKLE_CHARGE:
 	case PRE_CHARGE:
-	case FAST_CHARGE:
 	case FULLON_CHARGE:
 	case TAPER_CHARGE:
 		*val = POWER_SUPPLY_STATUS_CHARGING;
 		break;
+	case TERMINATE_CHARGE:
+		*val = POWER_SUPPLY_STATUS_FULL;
+		break;
+	case INHIBIT_CHARGE:
+	case PAUSE_CHARGE:
 	case DISABLE_CHARGE:
 		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
-		break;
-	case TERMINATE_CHARGE:
-	case INHIBIT_CHARGE:
-		*val = POWER_SUPPLY_STATUS_FULL;
 		break;
 	default:
 		*val = POWER_SUPPLY_STATUS_UNKNOWN;
@@ -456,6 +507,15 @@ static void smb_status_change_work(struct work_struct *work)
 		return;
 	}
 
+	/*
+	 * 插着电：清掉 USBIN 子块的锁存中断位（W1C，写 1 清）。
+	 * 过压/欠压比较器一旦锁存，内部的故障门会把充电一直挡住 ——
+	 * 即使 VBUS 本身已经正常（PD 从 5V 走到 9V 时最容易踩到）。
+	 * 配合 init 表里放宽的 OVP 窗口，清完之后 RT_STS 的对应位
+	 * 若仍为 1，说明是真实故障，下一次这里还会再清。
+	 */
+	regmap_write(chip->regmap, chip->base + USBIN_INT_LATCHED_CLR, 0xFF);
+
 	for (count = 0; count < 3; count++) {
 		dev_dbg(chip->dev, "get charger type retry %d\n", count);
 		rc = smb_apsd_get_charger_type(chip, &charger_type);
@@ -470,17 +530,41 @@ static void smb_status_change_work(struct work_struct *work)
 	}
 
 	if (rc < 0) {
-		rc = regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
-					APSD_RERUN_BIT, APSD_RERUN_BIT);
-		if (rc < 0) {
-			dev_err(chip->dev, "failed to rerun APSD: %d\n", rc);
+		/*
+		 * APSD 没出结果。重试几次，但别无限等：PD 充电器走的是
+		 * CC 协商，压根不发 BC1.2 的 D+/D- 握手，DONE 位可能永远
+		 * 不置位。这种情况下 tcpm 已经把 VBUS 谈好了（9V/3A），
+		 * 用电池 DT 的最大充电电流兜底是安全的 —— 总比 icl=0、
+		 * 插着充电器还在放电强。
+		 */
+		if (chip->apsd_retries++ < APSD_MAX_RETRIES) {
+			rc = regmap_update_bits(chip->regmap,
+						chip->base + CMD_APSD,
+						APSD_RERUN_BIT, APSD_RERUN_BIT);
+			if (rc < 0) {
+				dev_err(chip->dev,
+					"failed to rerun APSD: %d\n", rc);
+				return;
+			}
+			mod_delayed_work(system_dfl_wq,
+					 &chip->status_change_work,
+					 msecs_to_jiffies(APSD_RETRY_MS));
+			dev_dbg(chip->dev,
+				"get charger type failed, rerun apsd (%u/%u)\n",
+				chip->apsd_retries, APSD_MAX_RETRIES);
 			return;
 		}
-		mod_delayed_work(system_dfl_wq, &chip->status_change_work,
-				 msecs_to_jiffies(1000));
-		dev_dbg(chip->dev, "get charger type failed, rerun apsd\n");
-		return;
+
+		current_ua = chip->constant_charge_current_max_ua;
+		if (!READ_ONCE(chip->authenticated))
+			current_ua = min(current_ua, UNVERIFIED_CURRENT_UA);
+		dev_info(chip->dev,
+			 "APSD never completed, falling back to %u uA\n",
+			 current_ua);
+		goto set_limit;
 	}
+
+	chip->apsd_retries = 0;
 
 	switch (charger_type) {
 	case POWER_SUPPLY_USB_TYPE_CDP:
@@ -497,6 +581,7 @@ static void smb_status_change_work(struct work_struct *work)
 		break;
 	}
 
+set_limit:
 	rc = smb_set_current_limit(chip, current_ua);
 	if (rc < 0) {
 		dev_err(chip->dev, "failed to set input current limit: %d\n",
@@ -682,9 +767,29 @@ static const struct smb_init_register smb5_init_seq[] = {
 	  .mask = USBIN_MODE_CHG_BIT,
 	  .val = USBIN_MODE_CHG_BIT },
 	{ .addr = CMD_ICL_OVERRIDE, .mask = ICL_OVERRIDE_BIT, .val = 0 },
+	/*
+	 * ICL_OVERRIDE_AFTER_APSD：让写进 USBIN_CURRENT_LIMIT_CFG 的值
+	 * 活过 APSD 重跑。asidko/pm6150 的 SW_OVERRIDE_HC_MODE 第 7 步
+	 * 同样置位。
+	 *
+	 * 注：实测这块 PM8150B 读回 USBIN_LOAD_CFG 的 bit4 恒为 0，写不
+	 * 进去；但关掉 AICL 之后 ICL 已经能稳定站住（读到 0x78 = 3A），
+	 * 所以这条留着无害 —— 万一换了 PMIC 型号或固件版本会生效。
+	 */
 	{ .addr = USBIN_LOAD_CFG,
 	  .mask = ICL_OVERRIDE_AFTER_APSD_BIT,
-	  .val = 0 },
+	  .val = ICL_OVERRIDE_AFTER_APSD_BIT },
+	/*
+	 * OVP 比较器窗口：5-12V + CONTINUOUS。
+	 * 不设的话 bootloader 默认的 5V-only 窗口会在 PD 上到 9V 时锁存
+	 * 过压，充电永久门控（见上面 USBIN_ADAPTER_ALLOW_CFG 的注释）。
+	 */
+	{ .addr = USBIN_ADAPTER_ALLOW_CFG,
+	  .mask = 0xff,
+	  .val = USBIN_ADAPTER_ALLOW_5V_TO_12V },
+	{ .addr = USBIN_ADAPTER_ALLOW_OVERRIDE,
+	  .mask = 0xff,
+	  .val = USBIN_ADAPTER_ALLOW_OVERRIDE_CONTINUOUS },
 	/* Disable watchdog */
 	{ .addr = SNARL_BARK_BITE_WD_CFG, .mask = 0xff, .val = 0 },
 	{ .addr = WD_CFG,
@@ -697,16 +802,19 @@ static const struct smb_init_register smb5_init_seq[] = {
 	 * the charger current limit (voltage drop?) or it reaches the programmed limit.
 	 */
 	/*
-	 * AICL 保持开启。曾经怀疑它把低电量时的输入限流砍到极低（看到
-	 * ICL 设 3A 而实际只有 117mA），关掉之后行为毫无变化 —— 那个 117mA
-	 * 是 LN8000 ADC 冻结后的假值，与 AICL 无关。AICL 是 VBUS 跌落时的
-	 * 保护，关掉只会在弱适配器上把电压拽塌，所以恢复。
+	 * 关掉硬件 AICL，但保留 SUSPEND_ON_COLLAPSE。
+	 *
+	 * 这里走的是软件静态限流（icr_override + USBIN_CURRENT_LIMIT_CFG），
+	 * AICL 的周期性重跑会把我们写死的值一轮轮往回改，和 APSD 一起
+	 * 造成 ICL 在 0 和各档之间振荡。PD 充电器接入时更是如此：
+	 * APSD 推不出类型 → AICL 反复探底 → ICL 落到 0。
+	 * SUSPEND_ON_COLLAPSE 留着：输入真的塌了还是要在硬件层面挂起。
+	 * 与 asidko/pm6150-charger-mainline 的 SW_OVERRIDE_HC_MODE 第 1 步一致。
 	 */
 	{ .addr = USBIN_AICL_OPTIONS_CFG,
 	  .mask = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT |
 		  USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT,
-	  .val = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT |
-		 USBIN_AICL_EN_BIT },
+	  .val = SUSPEND_ON_COLLAPSE_USBIN_BIT },
 	/*
 	 * This overrides all of the other current limit configs and is
 	 * expected to be used for setting limits based on temperature.
